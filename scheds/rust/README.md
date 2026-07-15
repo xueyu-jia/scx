@@ -12,6 +12,7 @@ main.rs or \*.bpf.c files.
 
 # Schedulers
 
+- [scx_agent_classed](scx_agent_classed/README.md)
 - [scx_beerland](scx_beerland/README.md)
 - [scx_bpfland](scx_bpfland/README.md)
 - [scx_flash](scx_flash/README.md)

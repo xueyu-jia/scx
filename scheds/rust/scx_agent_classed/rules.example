@@ -1,0 +1,5 @@
+# Exact Linux comm matches. Values are latency or batch.
+pipewire=latency
+wireplumber=latency
+ninja=batch
+rustc=batch

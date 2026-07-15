@@ -1,0 +1,5 @@
+# Rules used by the initial VM feasibility benchmarks.
+hackbench=batch
+schbench=latency
+stress-ng=batch
+stress-ng-cpu=batch
