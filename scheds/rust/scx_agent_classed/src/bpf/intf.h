@@ -5,7 +5,6 @@
 enum agent_consts {
 	NSEC_PER_USEC		= 1000ULL,
 	NSEC_PER_MSEC		= 1000ULL * NSEC_PER_USEC,
-	NSEC_PER_SEC		= 1000ULL * NSEC_PER_MSEC,
 	AGENT_COMM_LEN		= 16,
 	AGENT_MAX_CPUS		= 4096,
 	AGENT_MAX_RULES		= 1024,
@@ -38,6 +37,13 @@ struct rule_key {
 
 struct rule_value {
 	u32 class_id;
+};
+
+struct agent_cpu_topology {
+	u32 llc_id;
+	u32 node_id;
+	u32 capacity;
+	u32 _pad;
 };
 
 #endif /* __SCX_AGENT_CLASSED_INTF_H */

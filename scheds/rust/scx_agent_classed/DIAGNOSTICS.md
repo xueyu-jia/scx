@@ -1,5 +1,10 @@
 # Mixed-workload diagnostics
 
+> **Superseded historical evidence:** this document records experiments across
+> several retired implementations and preserves their original terminology and
+> results. It is not the current policy contract. See [`README.md`](README.md)
+> for the active scheduler architecture and configuration.
+
 This document records the initial diagnosis of `scx_agent_classed` on Linux
 6.18.0. It is evidence for policy development, not a production benchmark.
 
@@ -569,3 +574,157 @@ The recommended order after the current port is:
 5. Only then test queue-pressure sleeper-credit decay. Rusty/LAVD criticality
    and P2DQ's complete pick-two policy would add a second classifier inside the
    already explicit LATENCY class and should remain lower priority.
+
+## Adaptive BATCH epoch experiment
+
+An optional per-task BATCH epoch was added on 2026-07-15 without changing the
+per-CPU vruntime DSQs or class arbitration. The base BATCH slice remains 2 ms.
+With `--batch-max-epoch-us=8000`, a task which repeatedly consumes its complete
+grant grows through 2, 4, and 8 ms. Leaving the option unset, or setting it to
+2 ms, disables growth.
+
+Growth requires a zero remaining slice and at least seven eighths of the grant
+to have executed. It is admitted only while BATCH remains the selected class
+and the task's projected vruntime does not pass the local BATCH DSQ head.
+Sleep, early stop, migration, remote dispatch, class change, or local LATENCY
+activity resets the task to 2 ms. A LATENCY enqueue also invalidates the CPU's
+BATCH generation and shortens a running long segment to the next base-slice
+boundary. The dispatch reservation is shortened by the same amount, so class
+vruntime accounts for the dynamic grant rather than assuming a 2 ms slice.
+
+Reservation extension, LATENCY revocation, and `stopping()` release share a
+four-state claim protocol with explicit locked and releasing states. A pending
+revocation survives claim contention and prevents another long continuation.
+The BATCH-only and MIX diagnostic smoke experiments both passed. They observed
+long-epoch dispatches, and the MIX run observed LATENCY-triggered revocation.
+Both finished with zero dispatch-reservation and task-state errors.
+
+The formal control and adaptive configurations used the same frozen binary:
+
+```text
+cf91ddb8a77d9188124d7208fd7062c48e39cd87e7babf654ca52610f5ae9dce
+```
+
+Only `--batch-max-epoch-us` differed: 2 ms for the control and 8 ms for the
+candidate. This isolates the epoch policy from the reservation-state refactor.
+
+### Single-BATCH result
+
+The single-class experiment used a two-vCPU `small_core` VM pinned to host CPUs
+2 and 4, four continuously runnable `stress-ng --cpu` workers, a five-second
+workload warmup, and a 30-second measurement. Eight alternating pairs completed
+with all 16 runs passing.
+
+| Metric | Fixed 2 ms mean | Adaptive 2-8 ms mean | Mean paired change | Paired 95% CI |
+|---|---:|---:|---:|---:|
+| BATCH throughput | 4,875.09 | 4,855.12 | -0.408% | [-0.940%, +0.125%] |
+| Context switches / 30 s | 22,528.88 | 6,280.38 | -72.077% | [-81.804%, -62.349%] |
+| CPU migrations / 30 s | 13.13 | 13.50 | +5.128% | [-15.661%, +25.917%] |
+
+The adaptive policy clearly exercised its intended mechanism but did not
+increase useful work. Removing about 72% of task switches was insufficient to
+improve this CPU-only stress workload, so switching frequency is not its
+dominant throughput bottleneck.
+
+### Fixed-RPS MIX result
+
+The MIX experiment used the same separate-core VM placement, two BATCH workers,
+and `schbench -R 100`. A real five-second MIX warmup preceded each 30-second
+measurement. Eight alternating pairs completed with all 16 runs passing.
+
+| Metric | Fixed 2 ms mean | Adaptive 2-8 ms mean | Mean paired change | Paired 95% CI |
+|---|---:|---:|---:|---:|
+| BATCH throughput | 4,377.67 | 4,406.56 | +0.686% | [-1.263%, +2.635%] |
+| Request p50 | 3,004 us | 3,004 us | 0.000% | [0.000%, 0.000%] |
+| Request p90 | 3,004 us | 3,004 us | 0.000% | [0.000%, 0.000%] |
+| Request p99 | 3,010 us | 3,131 us | +4.028% | [-5.768%, +13.824%] |
+| Request p999 | 3,423.5 us | 3,533.5 us | +9.718% | [-25.452%, +44.888%] |
+| Context switches / 30 s | 7,872.88 | 7,897.12 | +0.403% | [-3.127%, +3.933%] |
+| CPU migrations / 30 s | 12.13 | 11.88 | +10.049% | [-29.043%, +49.141%] |
+
+The change column averages the percentage change of each pair; it is not the
+ratio of the two displayed group means. This distinction is especially visible
+for migrations because each run contains only 7-19 events. The absolute paired
+change was -0.25 migration per measurement and is also statistically
+indistinguishable from zero.
+
+All measurement commands requested exactly 100 RPS. Three pairs crossed a
+schbench reporting boundary: adaptive runs 4 and 5 counted 3,100 requests,
+while control run 7 counted 3,099; their partners counted 3,000. Restricting
+the sensitivity analysis to the five equal-count pairs produced BATCH
+throughput `+0.991%`, 95% CI `[-1.968%, +3.951%]`. Request p50 and p90 remained
+unchanged, while the p99 and p999 intervals still crossed zero. The conclusion
+therefore does not depend on treating a boundary burst as scheduler throughput.
+
+Rare histogram-bucket jumps were not directional. Candidate p999 reached about
+6 ms in pair 7, while control p999 reached about 6 ms in pair 8. One candidate
+p99 reached about 4 ms. The large paired intervals reflect these sparse events;
+they do not establish an adaptive-epoch tail regression. Final wakeup samples
+near 700-800 ms were scheduler teardown artifacts and were excluded from the
+request-latency pairing.
+
+Unlike the single-BATCH experiment, MIX showed no context-switch reduction.
+Frequent LATENCY activity intentionally invalidates long BATCH epochs, so the
+candidate usually returns to the 2 ms base path when latency protection matters.
+The policy therefore behaves as a guardrailed optimization, but this workload
+shows neither a statistically supported throughput gain nor a latency gain.
+The 8 ms maximum must remain opt-in and should not replace the 2 ms default.
+
+The next useful epoch experiment needs cache-sensitive work with job structure,
+such as builds, compression, or encoding, and should collect cycles,
+instructions, LLC/TLB misses, epoch transitions, and dispatch cost. If those
+workloads also show no paired throughput gain, further epoch lengthening should
+stop in favor of simplifying the pure-BATCH dispatch hot path.
+
+## Superseded burst-adaptive EEVDF experiment
+
+The epoch experiment above is retained as historical evidence. A later
+prototype replaced that mechanism with eligible and future BATCH priority DSQs
+ordered by request deadline and virtual start. That prototype, its promotion
+state, and its reservation state have been removed from the current scheduler.
+
+The canonical adaptive defaults use 1, 2, 4, and 8 ms request levels, a 16 ms
+queue-round cap, bounded sleep lag, and earlier-deadline same-class wakeup
+preemption. Fixed-request experiment configurations override these defaults.
+Request exhaustion must pass through `stopping()` and re-enqueue before a new
+request is created, so the dispatch reservation never spans two requests.
+
+It was a discrete SCX approximation rather than Linux EEVDF. The frozen binary
+and results above remain only as controls for the historical experiments.
+
+## Final unified-arbiter validation
+
+The final failure was not a debt parameter or timer problem. A task inserted
+from `enqueue()` is not visible through `scx_bpf_dsq_nr_queued()` until the
+callback returns. The wakeup path collected candidates from visible DSQs only,
+so a newly arriving LATENCY task was omitted and a running BATCH task could
+retain its learned 8 ms epoch. Explicitly adding the incoming class to the same
+`decide_class()` candidate mask fixed the issue without a second policy path.
+
+A four-pair production run used a two-vCPU SMT VM, two saturated BATCH workers,
+`schbench -R 100 -n 5`, a five-second real MIX warmup, and 30-second
+measurements. All eight runs passed.
+
+| Metric | alt_default mean | scx_agent_classed mean | Mean paired change | Paired 95% CI |
+|---|---:|---:|---:|---:|
+| Request p50 | 6,824 us | 5,924 us | -13.18% | [-14.94%, -11.42%] |
+| Request p90 | 8,032 us | 6,072 us | -24.40% | [-24.71%, -24.09%] |
+| Request p99 | 9,384 us | 6,208 us | -33.84% | [-34.51%, -33.18%] |
+| Request p999 | 9,720 us | 6,344 us | -34.71% | [-36.65%, -32.77%] |
+| BATCH throughput | 3,144.27 | 3,076.61 | -2.15% | [-4.95%, +0.64%] |
+| Context switches | 14,845.25 | 14,183.00 | -4.45% | [-6.43%, -2.46%] |
+| CPU migrations | 278.25 | 56.25 | -79.79% | [-82.50%, -77.09%] |
+
+The runs crossed schbench's final reporting boundary at different points and
+counted between 3,000 and 3,100 requests. The displayed RPS difference is
+therefore not treated as scheduler throughput. Request latencies, BATCH
+throughput, context switches per request, and migrations per request remain
+directly interpretable.
+
+Single-pair coverage also exercised both class-only paths. BATCH stress-ng
+throughput was effectively unchanged at 4,866.83 versus 4,862.77 ops/s, while
+context switches fell from 31,610 to 7,831. The LATENCY-only run improved
+schbench throughput from 678.13 to 752.33 requests/s, request p90 from 7,992 to
+5,912 us, and p99 from 15,984 to 6,984 us; p50 moved from 4,200 to 4,680 us and
+migrations increased from 339 to 24,753 because idle-CPU placement remained
+aggressive. These class-only numbers are diagnostics, not confidence intervals.

@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use crossbeam::channel::RecvTimeoutError;
+use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::{MapCore, MapFlags, OpenObject, PrintLevel};
 use log::{debug, info, warn};
 use scx_stats::prelude::*;
@@ -25,6 +26,7 @@ use scx_utils::build_id;
 use scx_utils::compat;
 use scx_utils::init_libbpf_logging;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
+use scx_utils::Topology;
 use scx_utils::{
     scx_ops_attach, scx_ops_load, scx_ops_open, try_set_rlimit_infinity, uei_exited, uei_report,
     UserExitInfo,
@@ -33,9 +35,12 @@ use scx_utils::{
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_agent_classed";
-const COMM_LEN: usize = 16;
+const COMM_LEN: usize = bpf_intf::agent_consts_AGENT_COMM_LEN as usize;
 const MAX_VISIBLE_COMM_LEN: usize = COMM_LEN - 1;
-const MAX_STEAL_SCAN: u32 = 32;
+const MAX_STEAL_SCAN: u32 = bpf_intf::agent_consts_AGENT_STEAL_SCAN_MAX;
+const DEFAULT_BATCH_MIN_EPOCH_US: u64 = 1000;
+const DEFAULT_BATCH_MAX_EPOCH_US: u64 = 8000;
+const _: () = assert!(std::mem::size_of::<bpf_intf::agent_cpu_topology>() == 16);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum WorkloadClass {
@@ -67,21 +72,33 @@ struct Opts {
     #[clap(long, default_value = "1000")]
     latency_slice_us: u64,
 
-    /// BATCH task time slice in microseconds.
-    #[clap(long, default_value = "2000")]
-    batch_slice_us: u64,
+    /// Initial and minimum adaptive BATCH epoch in microseconds.
+    #[clap(long, default_value_t = DEFAULT_BATCH_MIN_EPOCH_US)]
+    batch_min_epoch_us: u64,
+
+    /// Maximum adaptive BATCH epoch in microseconds.
+    #[clap(long, default_value_t = DEFAULT_BATCH_MAX_EPOCH_US)]
+    batch_max_epoch_us: u64,
+
+    /// Target maximum BATCH queue round in microseconds.
+    #[clap(long, default_value = "16000")]
+    batch_round_us: u64,
 
     /// Total LATENCY runtime budget for one wakeup, including continuation.
     #[clap(long, default_value = "2000")]
     latency_burst_us: u64,
 
-    /// Maximum per-CPU LATENCY class debt allowed for wakeup preemption.
-    #[clap(long, default_value = "500")]
+    /// Maximum per-CPU LATENCY class debt used by all class arbitration paths.
+    #[clap(long, default_value = "1000")]
     class_max_debt_us: u64,
 
-    /// Minimum uninterrupted BATCH runtime before LATENCY may preempt it.
+    /// Minimum uninterrupted BATCH runtime before a class or vruntime handoff.
     #[clap(long, default_value = "500")]
     batch_min_run_us: u64,
+
+    /// Vruntime gap required for a BATCH same-class handoff.
+    #[clap(long, default_value = "500")]
+    batch_preempt_granularity_us: u64,
 
     /// LATENCY class share weight.
     #[clap(long, default_value = "200")]
@@ -90,10 +107,6 @@ struct Opts {
     /// BATCH class share weight.
     #[clap(long, default_value = "100")]
     batch_weight: u64,
-
-    /// Legacy compatibility option; per-CPU class arbitration does not use locality bypass.
-    #[clap(long, default_value = "0")]
-    locality_debt_us: u64,
 
     /// Class assigned to a comm that does not match the rule table.
     #[clap(long, value_enum, default_value_t = WorkloadClass::Batch)]
@@ -111,9 +124,17 @@ struct Opts {
     #[clap(long, default_value = "8")]
     steal_scan: u32,
 
-    /// Legacy compatibility option; LATENCY always uses canonical vruntime.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    no_awake_vruntime: bool,
+    /// Estimated migration cost within one LLC in microseconds.
+    #[clap(long, default_value = "250")]
+    same_llc_migration_cost_us: u64,
+
+    /// Estimated migration cost within one NUMA node in microseconds.
+    #[clap(long, default_value = "500")]
+    same_node_migration_cost_us: u64,
+
+    /// Estimated migration cost across NUMA nodes in microseconds.
+    #[clap(long, default_value = "1000")]
+    remote_node_migration_cost_us: u64,
 
     /// Track unmatched comm values and report them during a clean shutdown.
     #[clap(long, action = clap::ArgAction::SetTrue)]
@@ -222,6 +243,48 @@ fn checked_ns(value_us: u64, name: &str) -> Result<u64> {
         .with_context(|| format!("{name} is too large"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BatchEpochPolicy {
+    min_epoch_ns: u64,
+    max_epoch_ns: u64,
+    round_ns: u64,
+    min_run_ns: u64,
+    preempt_granularity_ns: u64,
+}
+
+impl BatchEpochPolicy {
+    fn from_opts(opts: &Opts) -> Result<Self> {
+        let policy = Self {
+            min_epoch_ns: checked_ns(opts.batch_min_epoch_us, "batch-min-epoch-us")?,
+            max_epoch_ns: checked_ns(opts.batch_max_epoch_us, "batch-max-epoch-us")?,
+            round_ns: checked_ns(opts.batch_round_us, "batch-round-us")?,
+            min_run_ns: checked_ns(opts.batch_min_run_us, "batch-min-run-us")?,
+            preempt_granularity_ns: checked_ns(
+                opts.batch_preempt_granularity_us,
+                "batch-preempt-granularity-us",
+            )?,
+        };
+
+        policy
+            .min_epoch_ns
+            .checked_mul(8)
+            .context("batch-min-epoch-us is too large for epoch levels")?;
+        if policy.max_epoch_ns < policy.min_epoch_ns {
+            bail!("batch-max-epoch-us must be at least batch-min-epoch-us");
+        }
+        if policy.max_epoch_ns > policy.min_epoch_ns * 8 {
+            bail!("batch-max-epoch-us must not exceed eight times batch-min-epoch-us");
+        }
+        if policy.round_ns < policy.min_epoch_ns {
+            bail!("batch-round-us must be at least batch-min-epoch-us");
+        }
+        if policy.min_run_ns > policy.min_epoch_ns {
+            bail!("batch-min-run-us must not exceed batch-min-epoch-us");
+        }
+        Ok(policy)
+    }
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -231,20 +294,24 @@ struct Scheduler<'a> {
 impl<'a> Scheduler<'a> {
     fn init(opts: &Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         let latency_slice_ns = checked_ns(opts.latency_slice_us, "latency-slice-us")?;
-        let batch_slice_ns = checked_ns(opts.batch_slice_us, "batch-slice-us")?;
+        let batch = BatchEpochPolicy::from_opts(opts)?;
         let latency_burst_budget_ns = checked_ns(opts.latency_burst_us, "latency-burst-us")?;
         let class_max_debt_ns = checked_ns(opts.class_max_debt_us, "class-max-debt-us")?;
-        let batch_min_run_ns = checked_ns(opts.batch_min_run_us, "batch-min-run-us")?;
-        let locality_debt_ns = opts
-            .locality_debt_us
-            .checked_mul(1000)
-            .context("locality-debt-us is too large")?;
+        let same_llc_migration_cost_ns = checked_ns(
+            opts.same_llc_migration_cost_us,
+            "same-llc-migration-cost-us",
+        )?;
+        let same_node_migration_cost_ns = checked_ns(
+            opts.same_node_migration_cost_us,
+            "same-node-migration-cost-us",
+        )?;
+        let remote_node_migration_cost_ns = checked_ns(
+            opts.remote_node_migration_cost_us,
+            "remote-node-migration-cost-us",
+        )?;
         latency_slice_ns
-            .checked_mul(4)
-            .context("latency-slice-us is too large for latency accounting")?;
-        batch_slice_ns
             .checked_mul(2)
-            .context("batch-slice-us is too large for class accounting")?;
+            .context("latency-slice-us is too large for latency accounting")?;
         if latency_burst_budget_ns < latency_slice_ns {
             bail!("latency-burst-us must be at least latency-slice-us");
         }
@@ -254,17 +321,19 @@ impl<'a> Scheduler<'a> {
         if class_max_debt_ns > i64::MAX as u64 {
             bail!("class-max-debt-us exceeds the signed vruntime comparison range");
         }
-        if batch_min_run_ns > batch_slice_ns {
-            bail!("batch-min-run-us must not exceed batch-slice-us");
-        }
         if opts.latency_weight == 0 || opts.batch_weight == 0 {
             bail!("class weights must be greater than zero");
         }
         if opts.steal_scan > MAX_STEAL_SCAN {
             bail!("steal-scan must be in the range 0..={MAX_STEAL_SCAN}");
         }
+        if same_llc_migration_cost_ns > same_node_migration_cost_ns
+            || same_node_migration_cost_ns > remote_node_migration_cost_ns
+        {
+            bail!("migration costs must be ordered same-LLC <= same-node <= remote-node");
+        }
         let rules = load_rule_table(opts)?;
-
+        let topology = Topology::new().context("reading CPU topology")?;
         try_set_rlimit_infinity();
         info!(
             "{} {}",
@@ -275,11 +344,24 @@ impl<'a> Scheduler<'a> {
             "scheduler options: {}",
             std::env::args().collect::<Vec<_>>().join(" ")
         );
+        info!(
+            "effective BATCH policy: epoch={}..{} us round={} us min-run={} us preempt-granularity={} us",
+            batch.min_epoch_ns / 1000,
+            batch.max_epoch_ns / 1000,
+            batch.round_ns / 1000,
+            batch.min_run_ns / 1000,
+            batch.preempt_granularity_ns / 1000,
+        );
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, agent_classed_ops, open_opts)?;
+        if opts.verbose {
+            for mut program in skel.open_object_mut().progs_mut() {
+                program.set_log_level(1);
+            }
+        }
 
         skel.struct_ops.agent_classed_ops_mut().exit_dump_len = opts.exit_dump_len;
         skel.struct_ops.agent_classed_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
@@ -295,16 +377,20 @@ impl<'a> Scheduler<'a> {
             .context("missing BPF rodata")?;
         rodata.debug = opts.debug;
         rodata.latency_slice_ns = latency_slice_ns;
-        rodata.batch_slice_ns = batch_slice_ns;
+        rodata.batch_min_epoch_ns = batch.min_epoch_ns;
+        rodata.batch_max_epoch_ns = batch.max_epoch_ns;
+        rodata.batch_round_ns = batch.round_ns;
         rodata.latency_burst_budget_ns = latency_burst_budget_ns;
         rodata.class_max_debt_ns = class_max_debt_ns;
-        rodata.batch_min_run_ns = batch_min_run_ns;
+        rodata.batch_min_run_ns = batch.min_run_ns;
+        rodata.batch_preempt_granularity_ns = batch.preempt_granularity_ns;
         rodata.latency_weight = opts.latency_weight;
         rodata.batch_weight = opts.batch_weight;
-        rodata.locality_debt_ns = locality_debt_ns;
         rodata.default_class = opts.default_class.as_bpf();
         rodata.steal_scan = opts.steal_scan;
-        rodata.use_awake_vruntime = !opts.no_awake_vruntime;
+        rodata.same_llc_migration_cost_ns = same_llc_migration_cost_ns;
+        rodata.same_node_migration_cost_ns = same_node_migration_cost_ns;
+        rodata.remote_node_migration_cost_ns = remote_node_migration_cost_ns;
         rodata.track_rule_misses = opts.track_rule_misses;
         rodata.diagnostic_counters = opts.diagnostic_counters;
 
@@ -313,6 +399,29 @@ impl<'a> Scheduler<'a> {
             skel.maps
                 .rules_map
                 .update(key, &class_id.to_ne_bytes(), MapFlags::ANY)?;
+        }
+        let max_capacity = topology
+            .all_cpus
+            .values()
+            .map(|cpu| cpu.cpu_capacity)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        for cpu in topology.all_cpus.values() {
+            let cpu_id = u32::try_from(cpu.id).context("CPU ID exceeds u32")?;
+            if cpu_id >= bpf_intf::agent_consts_AGENT_MAX_CPUS {
+                bail!("CPU ID {cpu_id} exceeds scheduler topology map capacity");
+            }
+            let llc_id = u32::try_from(cpu.llc_id).context("LLC ID exceeds u32")?;
+            let node_id = u32::try_from(cpu.node_id).context("NUMA node ID exceeds u32")?;
+            let capacity = (cpu.cpu_capacity * 1024 / max_capacity).clamp(1, 1024) as u32;
+            let mut value = [0u8; 16];
+            value[0..4].copy_from_slice(&llc_id.to_ne_bytes());
+            value[4..8].copy_from_slice(&node_id.to_ne_bytes());
+            value[8..12].copy_from_slice(&capacity.to_ne_bytes());
+            skel.maps
+                .cpu_topology_map
+                .update(&cpu_id.to_ne_bytes(), &value, MapFlags::ANY)?;
         }
         info!(
             "loaded {} static rules; unmatched tasks use {:?}",
@@ -348,60 +457,49 @@ impl<'a> Scheduler<'a> {
             nr_direct_dispatches: bss.nr_direct_dispatches,
             nr_latency_preempts: bss.nr_latency_preempts,
             nr_latency_wakeup_enqueues: bss.nr_latency_wakeup_enqueues,
-            nr_latency_preempt_eligible: bss.nr_latency_preempt_eligible,
-            nr_latency_preempt_ineligible: bss.nr_latency_preempt_ineligible,
-            nr_latency_preempt_insert_failures: bss.nr_latency_preempt_insert_failures,
-            nr_latency_preempt_batch_protected: bss.nr_latency_preempt_batch_protected,
-            nr_batch_guard_slice_shrinks: bss.nr_batch_guard_slice_shrinks,
-            nr_batch_guard_timer_arms: bss.nr_batch_guard_timer_arms,
-            nr_batch_guard_timer_kicks: bss.nr_batch_guard_timer_kicks,
-            nr_batch_guard_timer_failures: bss.nr_batch_guard_timer_failures,
+            nr_latency_handoffs: bss.nr_latency_handoffs,
+            nr_latency_handoff_deferred: bss.nr_latency_handoff_deferred,
+            nr_arbitration_slice_caps: bss.nr_arbitration_slice_caps,
             nr_latency_non_wakeup_enqueues: bss.nr_latency_non_wakeup_enqueues,
             nr_latency_continuations: bss.nr_latency_continuations,
-            nr_latency_continuation_debt_denied: bss.nr_latency_continuation_debt_denied,
+            nr_latency_continuation_class_denied: bss.nr_latency_continuation_class_denied,
             nr_latency_continuation_budget_exhausted: bss.nr_latency_continuation_budget_exhausted,
             nr_latency_continuation_history_denied: bss.nr_latency_continuation_history_denied,
-            nr_latency_continuation_insert_failures: bss.nr_latency_continuation_insert_failures,
             nr_latency_stops_runnable: bss.nr_latency_stops_runnable,
             nr_latency_stops_quiescent: bss.nr_latency_stops_quiescent,
             nr_latency_slice_expirations: bss.nr_latency_slice_expirations,
+            nr_batch_epochs: bss.nr_batch_epochs,
+            nr_batch_epoch_exhaustions: bss.nr_batch_epoch_exhaustions,
+            nr_batch_epoch_grows: bss.nr_batch_epoch_grows,
+            nr_batch_epoch_resets: bss.nr_batch_epoch_resets,
+            nr_batch_round_caps: bss.nr_batch_round_caps,
+            nr_batch_grants_1x: bss.nr_batch_grants_1x,
+            nr_batch_grants_2x: bss.nr_batch_grants_2x,
+            nr_batch_grants_4x: bss.nr_batch_grants_4x,
+            nr_batch_grants_8x: bss.nr_batch_grants_8x,
+            nr_batch_vruntime_preempts: bss.nr_batch_vruntime_preempts,
             nr_local_dispatches: bss.nr_local_dispatches,
             nr_remote_dispatches: bss.nr_remote_dispatches,
             nr_latency_local_dispatches: bss.nr_latency_local_dispatches,
             nr_batch_local_dispatches: bss.nr_batch_local_dispatches,
-            nr_latency_remote_dispatches: bss.nr_latency_remote_dispatches,
-            nr_batch_remote_dispatches: bss.nr_batch_remote_dispatches,
             nr_latency_migrations: bss.nr_latency_migrations,
             nr_batch_migrations: bss.nr_batch_migrations,
-            nr_locality_bypass_latency: bss.nr_locality_bypass_latency,
-            nr_locality_bypass_batch: bss.nr_locality_bypass_batch,
-            nr_locality_debt_denials: bss.nr_locality_debt_denials,
-            nr_locality_remote_preferred: bss.nr_locality_remote_preferred,
-            nr_locality_overdebt_fallbacks: bss.nr_locality_overdebt_fallbacks,
-            nr_locality_reservation_rollbacks: bss.nr_locality_reservation_rollbacks,
-            nr_locality_reservation_errors: bss.nr_locality_reservation_errors,
-            latency_locality_bypass_runtime_ns: bss.latency_locality_bypass_runtime_ns,
-            batch_locality_bypass_runtime_ns: bss.batch_locality_bypass_runtime_ns,
-            max_locality_debt_ns: bss.max_locality_debt_ns,
-            max_locality_overshoot_ns: bss.max_locality_overshoot_ns,
-            latency_locality_reserved_vruntime: latency.locality_reserved_vruntime,
-            batch_locality_reserved_vruntime: batch.locality_reserved_vruntime,
             nr_fallback_dispatches: bss.nr_fallback_dispatches,
             nr_dequeues: bss.nr_dequeues,
             nr_task_state_errors: bss.nr_task_state_errors,
+            nr_enqueue_ownership_reconciles: bss.nr_enqueue_ownership_reconciles,
+            nr_running_queue_reconciles: bss.nr_running_queue_reconciles,
             nr_rule_matches: bss.nr_rule_matches,
             nr_rule_misses: bss.nr_rule_misses,
             latency_runtime_ns: bss.latency_runtime_ns,
             batch_runtime_ns: bss.batch_runtime_ns,
             nr_fallback_enqueues: bss.nr_fallback_enqueues,
-            latency_reserved_vruntime: bss.latency_reserved_vruntime,
             nr_single_class_fastpaths: bss.nr_single_class_fastpaths,
             nr_mixed_class_arbitrations: bss.nr_mixed_class_arbitrations,
-            nr_dispatch_reservations: bss.nr_dispatch_reservations,
-            nr_dispatch_reservation_rollbacks: bss.nr_dispatch_reservation_rollbacks,
-            nr_dispatch_reservation_errors: bss.nr_dispatch_reservation_errors,
-            nr_dispatch_reservation_late: bss.nr_dispatch_reservation_late,
-            nr_dispatch_cpu_mismatches: bss.nr_dispatch_cpu_mismatches,
+            nr_class_decisions_latency: bss.nr_class_decisions_latency,
+            nr_class_decisions_batch: bss.nr_class_decisions_batch,
+            nr_class_decisions_batch_min_run: bss.nr_class_decisions_batch_min_run,
+            mixed_class_lag_ns: bss.mixed_class_lag_ns,
             nr_gated_steal_attempts: bss.nr_gated_steal_attempts,
             nr_gated_steal_successes: bss.nr_gated_steal_successes,
             nr_gated_steal_local_busy: bss.nr_gated_steal_local_busy,
@@ -411,7 +509,6 @@ impl<'a> Scheduler<'a> {
             nr_gated_steal_claim_busy: bss.nr_gated_steal_claim_busy,
         }
     }
-
     fn exited(&mut self) -> bool {
         uei_exited!(&self.skel, uei)
     }
@@ -582,5 +679,87 @@ mod tests {
         let error = parse_rule("worker=interactive", "test").unwrap_err();
 
         assert!(error.to_string().contains("expected latency or batch"));
+    }
+    #[test]
+    fn canonical_batch_epoch_defaults() {
+        let opts = Opts::try_parse_from(["scx_agent_classed"]).unwrap();
+        let policy = BatchEpochPolicy::from_opts(&opts).unwrap();
+
+        assert_eq!(
+            policy,
+            BatchEpochPolicy {
+                min_epoch_ns: 1_000_000,
+                max_epoch_ns: 8_000_000,
+                round_ns: 16_000_000,
+                min_run_ns: 500_000,
+                preempt_granularity_ns: 500_000,
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_class_debt_default() {
+        let opts = Opts::try_parse_from(["scx_agent_classed"]).unwrap();
+
+        assert_eq!(opts.class_max_debt_us, opts.latency_slice_us);
+    }
+
+    #[test]
+    fn accepts_explicit_batch_epoch_policy() {
+        let opts = Opts::try_parse_from([
+            "scx_agent_classed",
+            "--batch-min-epoch-us",
+            "2000",
+            "--batch-max-epoch-us",
+            "8000",
+            "--batch-round-us",
+            "24000",
+            "--batch-min-run-us",
+            "750",
+            "--batch-preempt-granularity-us",
+            "1000",
+        ])
+        .unwrap();
+        let policy = BatchEpochPolicy::from_opts(&opts).unwrap();
+
+        assert_eq!(policy.min_epoch_ns, 2_000_000);
+        assert_eq!(policy.max_epoch_ns, 8_000_000);
+        assert_eq!(policy.round_ns, 24_000_000);
+        assert_eq!(policy.min_run_ns, 750_000);
+        assert_eq!(policy.preempt_granularity_ns, 1_000_000);
+    }
+
+    #[test]
+    fn rejects_batch_epoch_range_over_eight_levels() {
+        let opts = Opts::try_parse_from([
+            "scx_agent_classed",
+            "--batch-min-epoch-us",
+            "1000",
+            "--batch-max-epoch-us",
+            "9000",
+        ])
+        .unwrap();
+
+        assert!(BatchEpochPolicy::from_opts(&opts)
+            .unwrap_err()
+            .to_string()
+            .contains("eight times"));
+    }
+
+    #[test]
+    fn rejects_batch_min_run_over_min_epoch() {
+        let opts = Opts::try_parse_from([
+            "scx_agent_classed",
+            "--batch-min-epoch-us",
+            "1000",
+            "--batch-min-run-us",
+            "1500",
+        ])
+        .unwrap();
+
+        assert!(BatchEpochPolicy::from_opts(&opts)
+            .unwrap_err()
+            .to_string()
+            .contains("must not exceed"));
     }
 }
