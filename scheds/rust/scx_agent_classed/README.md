@@ -24,6 +24,13 @@ Each possible CPU owns exactly two priority DSQs:
 - `LATENCY[cpu]`, ordered by weighted task vruntime.
 - `BATCH[cpu]`, ordered by weighted task vruntime.
 
+Normal enqueue always uses `scx_bpf_task_cpu(p)` as the user-DSQ owner. The
+kernel therefore holds that CPU's task-rq lock while enqueue arbitration reads
+and caps the current task. `home_cpu` is only a hint for the next
+`select_cpu()` call. Idle LATENCY direct dispatch to a built-in local DSQ is
+the sole enqueue-time remote-placement exception and does not modify a remote
+current task.
+
 Actual execution time advances task vruntime and the corresponding per-CPU and
 global class entities. Queue ordering never uses the configured time slice or
 BATCH epoch as its key.
@@ -45,8 +52,10 @@ struct class_decision {
 The candidate mask is built from work that can actually run locally: a task in
 a class DSQ, the currently runnable task, or the task whose enqueue callback is
 in progress. The last case is explicit because SCX does not publish a pending
-DSQ insertion until `enqueue()` returns. Queue and running counters are
-accounting data, not substitutes for this candidate check.
+DSQ insertion until `enqueue()` returns. An incoming BATCH task's vruntime also
+participates in the same-class handoff check before it becomes the visible DSQ
+head. Queue and running counters are accounting data, not substitutes for this
+candidate check.
 
 If only one class is available, it wins immediately. If both are available,
 the picker compares projected class vruntimes, including the current task's
@@ -69,10 +78,11 @@ time before the next LATENCY handoff. This is per-CPU class state: an
 interruption or a switch between BATCH tasks does not renew the protection.
 `decide_class()` returns the winner's service budget in `run_for_ns`.
 `U64_MAX` means that only one class is runnable. When the winner differs from
-the current class, the scheduler requests an immediate handoff; the budget is
-then applied while moving the winner into the local DSQ. A finite budget only
-shrinks a task's residual slice. Slice expiry returns to dispatch, which invokes
-the same arbitration again. There is no second arbitration path or queue model.
+the current class, the scheduler sets the current task's slice to zero while
+owning its rq and sends an ordinary reschedule notification. A finite budget
+only shrinks the residual slice and sends no kick. Slice expiry returns to
+dispatch, which invokes the same arbitration again. There is no remote slice
+writer, seqcount recovery, second arbitration path, or queue model.
 
 Dispatch first tries `winner` with `min(task_slice, run_for_ns)`, then
 `fallback`, recollects the real DSQ mask, and retries only classes which are
@@ -98,8 +108,8 @@ selection derived from `scx_forge`.
 - A continuation grants at most one `latency_slice` at a time. The default
   configuration allows 2 ms total service for one wakeup; the configurable
   burst limit is validated independently.
-- Every continuation advances the running task's preemption epoch, so a prior
-  handoff request cannot suppress a later valid handoff on the new slice.
+- Continuation and enqueue handoff are serialized by the target rq lock, so a
+  wakeup cap cannot race with and be overwritten by a slice refill.
 
 The bounded continuation improves short multi-slice bursts without giving the
 LATENCY class unconditional service.
@@ -136,7 +146,8 @@ Wake placement starts from a task's sticky home or previous CPU. Idle CPU
 selection uses the kernel topology-aware helper. When all allowed CPUs are
 busy, BATCH placement may scan a bounded set of CPUs and compares
 capacity-normalized queued service plus the configured LLC or NUMA migration
-cost. A migration cooldown prevents immediate bouncing.
+cost. The selected CPU becomes the kernel task-rq CPU and therefore the owner
+of the next user-DSQ enqueue. A migration cooldown prevents immediate bouncing.
 
 Remote dispatch is gated and runs only after the destination has no local
 candidate. A source must:

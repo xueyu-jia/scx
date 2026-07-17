@@ -118,7 +118,6 @@ struct task_ctx {
 	u64 batch_epoch_target_ns;
 	u64 batch_epoch_remaining_ns;
 	s64 sleep_vlag;
-	s32 target_cpu;
 	s32 last_cpu;
 	s32 home_cpu;
 	s32 vtime_cpu;
@@ -147,8 +146,6 @@ struct cpu_ctx {
 	u64 class_vtime_now;
 	u64 steal_claim;
 	u64 running_since;
-	u64 run_seq;
-	u64 preempt_seq;
 	u64 batch_service_since_latency;
 	u32 running_class;
 };
@@ -916,14 +913,13 @@ static bool dsq_head_vruntime(u64 dsq_id, u64 *vruntime)
 	return found;
 }
 
-static bool task_matches_run(const struct cpu_ctx *cpuc, s32 cpu, u64 run_seq,
+static bool task_matches_run(const struct cpu_ctx *cpuc, s32 cpu,
 			     const struct task_struct *p)
 {
 	struct task_ctx *tctx;
 	u32 class_id;
 
-	if (!p || p->flags & PF_IDLE || !run_seq || (run_seq & 1) ||
-	    READ_ONCE(cpuc->run_seq) != run_seq)
+	if (!p || p->flags & PF_IDLE || !READ_ONCE(cpuc->running_since))
 		return false;
 	class_id = READ_ONCE(cpuc->running_class);
 	tctx = lookup_task_ctx(p);
@@ -931,75 +927,46 @@ static bool task_matches_run(const struct cpu_ctx *cpuc, s32 cpu, u64 run_seq,
 	       tctx->class_id == class_id;
 }
 
-static bool request_cpu_preempt(struct cpu_ctx *cpuc, s32 cpu, u64 run_seq)
-{
-	struct task_struct *curr;
-	u64 old;
-
-	if (!run_seq || (run_seq & 1) ||
-	    READ_ONCE(cpuc->run_seq) != run_seq)
-		return false;
-	old = READ_ONCE(cpuc->preempt_seq);
-	if (old == run_seq ||
-	    __sync_val_compare_and_swap(&cpuc->preempt_seq, old, run_seq) != old)
-		return false;
-
-	bpf_rcu_read_lock();
-	curr = __COMPAT_scx_bpf_cpu_curr(cpu);
-	if (!task_matches_run(cpuc, cpu, run_seq, curr)) {
-		bpf_rcu_read_unlock();
-		__sync_val_compare_and_swap(&cpuc->preempt_seq, run_seq, old);
-		return false;
-	}
-	scx_bpf_task_set_slice(curr, 1);
-	bpf_rcu_read_unlock();
-
-	if (READ_ONCE(cpuc->run_seq) != run_seq) {
-		__sync_val_compare_and_swap(&cpuc->preempt_seq, run_seq, old);
-		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-		return false;
-	}
-	scx_bpf_kick_cpu(cpu, 0);
-	return true;
-}
-
-static bool cap_task_slice(struct cpu_ctx *cpuc, s32 cpu, u64 run_seq,
-			   struct task_struct *curr, u64 max_runtime)
+static bool cap_task_slice(struct cpu_ctx *cpuc, s32 cpu,
+			   struct task_struct *curr, u64 max_runtime,
+			   bool *shortened)
 {
 	u64 slice;
 
-	if (!task_matches_run(cpuc, cpu, run_seq, curr))
+	if (!task_matches_run(cpuc, cpu, curr))
 		return false;
 	slice = READ_ONCE(curr->scx.slice);
 	if (slice > max_runtime) {
 		scx_bpf_task_set_slice(curr, max_runtime);
-		if (diagnostic_counters)
+		*shortened = true;
+		if (max_runtime && diagnostic_counters)
 			__sync_fetch_and_add(&nr_arbitration_slice_caps, 1);
-	}
-	if (READ_ONCE(cpuc->run_seq) != run_seq) {
-		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-		return false;
 	}
 	return true;
 }
 
-/* Shrinking is idempotent. A zero budget requests an immediate handoff. */
-static bool cap_cpu_slice(struct cpu_ctx *cpuc, s32 cpu, u64 run_seq,
+/* Callers own the target rq. A zero cap needs only a reschedule notification. */
+static bool cap_cpu_slice(struct cpu_ctx *cpuc, s32 cpu,
 			  struct task_struct *curr, u64 max_runtime)
 {
+	bool shortened = false;
 	bool valid;
 
 	if (max_runtime == ~0ULL)
 		return true;
-	if (!max_runtime)
-		return request_cpu_preempt(cpuc, cpu, run_seq);
-	if (curr)
-		return cap_task_slice(cpuc, cpu, run_seq, curr, max_runtime);
-
-	bpf_rcu_read_lock();
-	curr = __COMPAT_scx_bpf_cpu_curr(cpu);
-	valid = cap_task_slice(cpuc, cpu, run_seq, curr, max_runtime);
-	bpf_rcu_read_unlock();
+	if (curr) {
+		valid = cap_task_slice(cpuc, cpu, curr, max_runtime, &shortened);
+	} else {
+		bpf_rcu_read_lock();
+		curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+		valid = cap_task_slice(cpuc, cpu, curr, max_runtime, &shortened);
+		bpf_rcu_read_unlock();
+	}
+	if (!max_runtime) {
+		if (valid && shortened)
+			scx_bpf_kick_cpu(cpu, 0);
+		return valid && shortened;
+	}
 	return valid;
 }
 
@@ -1007,12 +974,14 @@ static bool cap_cpu_slice(struct cpu_ctx *cpuc, s32 cpu, u64 run_seq,
  * Return the remaining runtime before a BATCH task handoff. Zero means now and
  * U64_MAX means that the current task remains competitive with the DSQ head.
  */
-static u64 batch_handoff_budget(struct cpu_ctx *cpuc, s32 cpu, u64 now)
+static u64 batch_handoff_budget(struct cpu_ctx *cpuc, s32 cpu, u64 now,
+				u32 incoming_class, u64 incoming_vruntime)
 {
 	struct task_struct *curr;
 	struct task_ctx *tctx;
 	u64 current_vruntime, elapsed, granularity, head_vruntime, started;
 	u64 budget = ~0ULL;
+	bool has_head;
 
 	if (READ_ONCE(cpuc->running_class) != CLASS_BATCH)
 		return ~0ULL;
@@ -1020,8 +989,14 @@ static u64 batch_handoff_budget(struct cpu_ctx *cpuc, s32 cpu, u64 now)
 	if (!started)
 		return ~0ULL;
 
-	if (!dsq_head_vruntime(CLASS_DSQ_ID(CLASS_BATCH, cpu),
-				&head_vruntime))
+	has_head = dsq_head_vruntime(CLASS_DSQ_ID(CLASS_BATCH, cpu),
+				      &head_vruntime);
+	if (incoming_class == CLASS_BATCH &&
+	    (!has_head || time_before(incoming_vruntime, head_vruntime))) {
+		head_vruntime = incoming_vruntime;
+		has_head = true;
+	}
+	if (!has_head)
 		return ~0ULL;
 
 	bpf_rcu_read_lock();
@@ -1045,30 +1020,20 @@ out:
 	return budget;
 }
 
-static void arbitrate_cpu(s32 cpu, struct task_struct *curr,
-			  u32 incoming_class)
+/* The caller must own @cpu's rq; remote paths may only move queued tasks. */
+static void arbitrate_locked_cpu(s32 cpu, struct task_struct *curr,
+				 u32 incoming_class, u64 incoming_vruntime)
 {
 	struct class_candidates candidates;
 	struct class_decision decision;
 	struct cpu_ctx *cpuc = lookup_cpu_ctx(cpu);
-	u64 batch_budget, budget, now, run_seq;
+	u64 batch_budget, budget, now;
 	u32 current, mask;
 
 	if (!cpuc)
 		return;
-	run_seq = READ_ONCE(cpuc->run_seq);
-	if (!run_seq || (run_seq & 1)) {
-		if (incoming_class < CLASS_NR)
-			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-		return;
-	}
 	current = READ_ONCE(cpuc->running_class);
 	now = bpf_ktime_get_ns();
-	if (READ_ONCE(cpuc->run_seq) != run_seq) {
-		if (incoming_class < CLASS_NR)
-			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-		return;
-	}
 
 	mask = local_available_mask(cpu, cpuc, true);
 	/* DSQ inserts are not visible to queue queries until enqueue() returns. */
@@ -1077,11 +1042,6 @@ static void arbitrate_cpu(s32 cpu, struct task_struct *curr,
 	candidates.available_mask = mask;
 	candidates.current_class = current;
 	decide_class(cpuc, now, &candidates, &decision);
-	if (READ_ONCE(cpuc->run_seq) != run_seq) {
-		if (incoming_class < CLASS_NR)
-			scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
-		return;
-	}
 	if (decision.winner >= CLASS_NR)
 		return;
 	record_mixed_class_decision(mask, &decision);
@@ -1090,10 +1050,10 @@ static void arbitrate_cpu(s32 cpu, struct task_struct *curr,
 		if (current == CLASS_BATCH &&
 		    decision.winner == CLASS_LATENCY) {
 			__sync_fetch_and_add(&nr_latency_handoffs, 1);
-			if (cap_cpu_slice(cpuc, cpu, run_seq, curr, 0))
+			if (cap_cpu_slice(cpuc, cpu, curr, 0))
 				__sync_fetch_and_add(&nr_latency_preempts, 1);
 		} else {
-			cap_cpu_slice(cpuc, cpu, run_seq, curr, 0);
+			cap_cpu_slice(cpuc, cpu, curr, 0);
 		}
 		return;
 	}
@@ -1104,9 +1064,10 @@ static void arbitrate_cpu(s32 cpu, struct task_struct *curr,
 		__sync_fetch_and_add(&nr_latency_handoff_deferred, 1);
 
 	if (current == CLASS_BATCH && decision.winner == CLASS_BATCH) {
-		batch_budget = batch_handoff_budget(cpuc, cpu, now);
+		batch_budget = batch_handoff_budget(cpuc, cpu, now,
+					    incoming_class, incoming_vruntime);
 		if (!batch_budget) {
-			if (cap_cpu_slice(cpuc, cpu, run_seq, curr, 0) &&
+			if (cap_cpu_slice(cpuc, cpu, curr, 0) &&
 			    diagnostic_counters)
 				__sync_fetch_and_add(&nr_batch_vruntime_preempts, 1);
 			return;
@@ -1114,7 +1075,7 @@ static void arbitrate_cpu(s32 cpu, struct task_struct *curr,
 		if (batch_budget < budget)
 			budget = batch_budget;
 	}
-	cap_cpu_slice(cpuc, cpu, run_seq, curr, budget);
+	cap_cpu_slice(cpuc, cpu, curr, budget);
 }
 
 /* Forge's default wakee policy: seed idle selection from the previous CPU. */
@@ -1188,7 +1149,6 @@ s32 BPF_STRUCT_OPS(agent_classed_select_cpu, struct task_struct *p,
 	prev_cpu = task_home_cpu(p, tctx, prev_cpu);
 	if (tctx->class_id != CLASS_LATENCY) {
 		cpu = batch_pick_cpu(p, tctx, prev_cpu, wake_flags, &is_idle);
-		tctx->target_cpu = cpu;
 		if (task_cpu_allowed(p, cpu))
 			tctx->home_cpu = cpu;
 		return cpu;
@@ -1202,7 +1162,6 @@ s32 BPF_STRUCT_OPS(agent_classed_select_cpu, struct task_struct *p,
 
 	cpu = latency_pick_idle_cpu(p, prev_cpu, wake_flags, false);
 	if (cpu >= 0) {
-		tctx->target_cpu = cpu;
 		tctx->home_cpu = cpu;
 		if (cpu_has_local_work(cpu, lookup_cpu_ctx(cpu)))
 			return cpu;
@@ -1214,7 +1173,6 @@ s32 BPF_STRUCT_OPS(agent_classed_select_cpu, struct task_struct *p,
 		return cpu;
 	}
 
-	tctx->target_cpu = prev_cpu;
 	return prev_cpu;
 }
 
@@ -1245,18 +1203,12 @@ void BPF_STRUCT_OPS(agent_classed_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 	}
 
-	cpu = tctx->target_cpu;
-	if (cpu < 0 || cpu >= nr_cpu_ids ||
-	    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		cpu = task_home_cpu(p, tctx, scx_bpf_task_cpu(p));
-	if (cpu < 0 || cpu >= nr_cpu_ids ||
-	    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		cpu = bpf_cpumask_first(p->cpus_ptr);
-	tctx->target_cpu = -1;
+	/* ops.enqueue() owns this task rq; its CPU is the user-DSQ owner. */
+	cpu = scx_bpf_task_cpu(p);
 	if (!task_cpu_allowed(p, tctx->home_cpu) && task_cpu_allowed(p, cpu))
 		tctx->home_cpu = cpu;
 
-	if (cpu < 0 || cpu >= nr_cpu_ids) {
+	if (!task_cpu_allowed(p, cpu)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, class_slice(class_id), enq_flags);
 		__sync_fetch_and_add(&nr_fallback_enqueues, 1);
 		return;
@@ -1302,7 +1254,7 @@ void BPF_STRUCT_OPS(agent_classed_enqueue, struct task_struct *p, u64 enq_flags)
 	else
 		__sync_fetch_and_add(&nr_batch_enqueues, 1);
 
-	arbitrate_cpu(cpu, NULL, class_id);
+	arbitrate_locked_cpu(cpu, NULL, class_id, key);
 	if (task_should_kick(p, enq_flags))
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
@@ -1750,32 +1702,24 @@ static bool try_keep_running(s32 cpu, struct task_struct *prev,
 			latency_burst_budget_ns - used : latency_slice_ns;
 		if (!slice || slice > latency_slice_ns)
 			slice = latency_slice_ns;
-		/* Publish the new slice and preemption epoch as one transaction. */
-		__sync_fetch_and_add(&cpuc->run_seq, 1);
 		scx_bpf_task_set_slice(prev, slice);
-		__sync_fetch_and_add(&cpuc->run_seq, 1);
 		if (diagnostic_counters)
 			__sync_fetch_and_add(&nr_latency_continuations, 1);
-		arbitrate_cpu(cpu, prev, CLASS_NR);
+		arbitrate_locked_cpu(cpu, prev, CLASS_NR, 0);
 		return true;
 	}
 
 	remaining = tctx->batch_epoch_remaining_ns;
 	if (remaining > elapsed) {
-		/* Publish the new slice and preemption epoch as one transaction. */
-		__sync_fetch_and_add(&cpuc->run_seq, 1);
 		scx_bpf_task_set_slice(prev, remaining - elapsed);
-		__sync_fetch_and_add(&cpuc->run_seq, 1);
-		arbitrate_cpu(cpu, prev, CLASS_NR);
+		arbitrate_locked_cpu(cpu, prev, CLASS_NR, 0);
 		return true;
 	}
 	if (has_head && !work_conserving)
 		return false;
 
-	/* Publish the runtime commit and new epoch as one run_seq transaction. */
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
 	if (!charge_runtime(prev, tctx, cpuc, elapsed, true))
-		goto publish_failed;
+		return false;
 	WRITE_ONCE(cpuc->running_since, now);
 	tctx->last_run_at = now;
 	vtime_set_max(&cpuc->entity[CLASS_BATCH].task_vtime,
@@ -1783,15 +1727,10 @@ static bool try_keep_running(s32 cpu, struct task_struct *prev,
 	slice = batch_start_epoch(tctx, cpuc, false);
 	if (slice)
 		scx_bpf_task_set_slice(prev, slice);
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
 	if (!slice)
 		return false;
-	arbitrate_cpu(cpu, prev, CLASS_NR);
+	arbitrate_locked_cpu(cpu, prev, CLASS_NR, 0);
 	return true;
-
-publish_failed:
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
-	return false;
 }
 
 void BPF_STRUCT_OPS(agent_classed_dispatch, s32 cpu, struct task_struct *prev)
@@ -1976,18 +1915,15 @@ void BPF_STRUCT_OPS(agent_classed_running, struct task_struct *p)
 	tctx->last_cpu = cpu;
 	tctx->running_cpu = cpu;
 	tctx->queued_cpu = -1;
-	tctx->target_cpu = -1;
 	tctx->state = TASK_NONE;
 	tctx->last_run_at = now;
 	vtime_set_max(&entity->task_vtime, tctx->vruntime);
 
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
 	WRITE_ONCE(cpuc->running_since, now);
 	WRITE_ONCE(cpuc->running_class, class_id);
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
 	__sync_fetch_and_add(&cctx->nr_running, 1);
 	__sync_fetch_and_add(&entity->nr_running, 1);
-	arbitrate_cpu(cpu, p, CLASS_NR);
+	arbitrate_locked_cpu(cpu, p, CLASS_NR, 0);
 }
 
 void BPF_STRUCT_OPS(agent_classed_stopping, struct task_struct *p, bool runnable)
@@ -2020,8 +1956,6 @@ void BPF_STRUCT_OPS(agent_classed_stopping, struct task_struct *p, bool runnable
 	now = bpf_ktime_get_ns();
 	runtime = now > tctx->last_run_at ? now - tctx->last_run_at : 1;
 
-	/* Odd run_seq hides the transition from concurrent arbitration checks. */
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
 	WRITE_ONCE(cpuc->running_class, CLASS_NR);
 	WRITE_ONCE(cpuc->running_since, 0);
 	if (!charge_runtime(p, tctx, cpuc, runtime, runnable))
@@ -2049,7 +1983,6 @@ void BPF_STRUCT_OPS(agent_classed_stopping, struct task_struct *p, bool runnable
 	}
 	tctx->last_run_at = 0;
 	tctx->running_cpu = -1;
-	__sync_fetch_and_add(&cpuc->run_seq, 1);
 }
 void BPF_STRUCT_OPS(agent_classed_runnable, struct task_struct *p, u64 enq_flags)
 {
@@ -2091,7 +2024,6 @@ void BPF_STRUCT_OPS(agent_classed_quiescent, struct task_struct *p, u64 deq_flag
 			reset_batch_epoch(tctx);
 	}
 	tctx->state = TASK_NONE;
-	tctx->target_cpu = -1;
 	tctx->queued_cpu = -1;
 }
 
@@ -2104,7 +2036,6 @@ static void reset_task_state(struct task_ctx *tctx, u32 class_id)
 	tctx->batch_epoch_target_ns = batch_min_epoch_ns;
 	tctx->batch_epoch_remaining_ns = 0;
 	tctx->sleep_vlag = 0;
-	tctx->target_cpu = -1;
 	tctx->last_cpu = -1;
 	tctx->home_cpu = -1;
 	tctx->vtime_cpu = -1;
